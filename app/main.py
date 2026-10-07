@@ -35,6 +35,7 @@ from .schemas import (
     ExhibitCreate,
     ExhibitOut,
     HandoverRecordOut,
+    PointInTimeStateOut,
     RehearsalOut,
     VehicleHandoverReport,
     VehicleHandoverRequest,
@@ -688,6 +689,208 @@ def get_exhibit(exhibit_id: str):
     row = dict(row)
     row["effective_chain_length"] = effective["effective_chain_length"]
     return row
+
+
+def _parse_point_in_time(raw: str) -> datetime:
+    """解析知悉时刻；必须显式携带时区。"""
+    value = raw.strip()
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="as_of 必须是 ISO 8601 且携带时区的时刻，如 2026-10-06T10:00:00+08:00 或 2026-10-06T02:00:00Z",
+        )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HTTPException(
+            status_code=422,
+            detail="as_of 必须携带时区偏移，业务发生时间或无时区时间不能作为知悉时刻",
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+@app.get("/api/v1/exhibits/{exhibit_id}/state-at", response_model=PointInTimeStateOut, tags=["exhibits"])
+def get_exhibit_state_at(
+    exhibit_id: str,
+    as_of: str = Query(..., description="带时区的知悉时刻（服务端事件 created_at 的上界，闭区间）"),
+):
+    """查询展品在指定知悉时刻的交接状态。
+
+    所有事件均以服务端 `created_at` 为边界，且在同一 REPEATABLE READ 只读快照中读取：
+    - 交接记录随其已受理批次的 `batches.created_at` 出现；交接业务时间 `occurred_at`
+      不决定何时受理，晚于知悉时刻录入的历史交接不得提前出现；
+    - 摘要补正随 `digest_corrections.created_at` 出现，每环只回显当时最新有效摘要；
+    - 批次撤回随 `batch_withdrawals.created_at` 生效，当时已撤回批次排除出有效列表；
+    - 原交接链长度/链头与原哈希仍包含当时已撤回批次；有效列表为空时回退登记状态。
+
+    未知展品、早于展品登记时刻 -> 404；无时区或未来时刻 -> 422。
+    """
+    point = _parse_point_in_time(as_of)
+
+    # 在同一事务的同一数据库快照内截取三条事件链。显式只读 + REPEATABLE READ，
+    # 防止查询期间新写入的受理/补正/撤回造成跨表不一致。
+    with get_conn() as conn:
+        conn.execute("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
+        db_now = conn.execute("SELECT now() AS now").fetchone()["now"]
+        if point > db_now:
+            raise HTTPException(status_code=422, detail="as_of 不能晚于数据库当前时间")
+
+        exhibit = conn.execute(
+            "SELECT * FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)
+        ).fetchone()
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        registered_at = exhibit["created_at"]
+        if point < registered_at:
+            raise HTTPException(
+                status_code=404,
+                detail=f"知悉时刻早于展品「{exhibit_id}」登记时刻 {registered_at.isoformat()}",
+            )
+
+        records = conn.execute(
+            """
+            SELECT r.*, b.created_at AS accepted_at
+              FROM handover_records r
+              JOIN batches b
+                ON b.batch_id = r.batch_id
+             WHERE r.exhibit_id = %s
+               AND b.status = 'ACCEPTED'
+               AND b.created_at <= %s
+             ORDER BY r.chain_seq
+            """,
+            (exhibit_id, point),
+        ).fetchall()
+
+        corrections = conn.execute(
+            """
+            SELECT c.*
+              FROM digest_corrections c
+              JOIN handover_records r
+                ON r.exhibit_id = c.exhibit_id
+               AND r.chain_seq = c.target_chain_seq
+              JOIN batches b
+                ON b.batch_id = r.batch_id
+             WHERE c.exhibit_id = %s
+               AND c.created_at <= %s
+               AND b.status = 'ACCEPTED'
+               AND b.created_at <= %s
+             ORDER BY c.correction_seq
+            """,
+            (exhibit_id, point, point),
+        ).fetchall()
+
+        withdrawals = conn.execute(
+            """
+            SELECT w.*
+              FROM batch_withdrawals w
+              JOIN batches b
+                ON b.batch_id = w.batch_id
+             WHERE w.exhibit_id = %s
+               AND w.created_at <= %s
+               AND b.status = 'ACCEPTED'
+               AND b.created_at <= %s
+             ORDER BY w.withdrawal_seq
+            """,
+            (exhibit_id, point, point),
+        ).fetchall()
+
+    corrections_by_seq: dict[int, list[dict]] = {}
+    for c in corrections:
+        corrections_by_seq.setdefault(c["target_chain_seq"], []).append({
+            "correction_id": str(c["correction_id"]),
+            "correction_seq": c["correction_seq"],
+            "target_chain_seq": c["target_chain_seq"],
+            "expected_digest": c["expected_digest"],
+            "old_digest": c["old_digest"],
+            "new_digest": c["new_digest"],
+            "reason": c["reason"],
+            "anchor_record_hash": c["anchor_record_hash"],
+            "record_hash": c["record_hash"],
+            "idempotent_replay": False,
+            "created_at": c["created_at"],
+        })
+
+    withdrawn_by_batch = {w["batch_id"]: w for w in withdrawals}
+    original_rings = []
+    effective_records = []
+    for r in records:
+        trail = corrections_by_seq.get(r["chain_seq"], [])
+        current_digest = _current_digest(r["voucher_digest"], trail)
+        withdrawal = withdrawn_by_batch.get(r["batch_id"])
+        original_rings.append({
+            "chain_seq": r["chain_seq"],
+            "batch_id": str(r["batch_id"]),
+            "accepted_at": r["accepted_at"],
+            "voucher_digest": r["voucher_digest"],
+            "current_voucher_digest": current_digest,
+            "prev_hash": r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "withdrawn": withdrawal is not None,
+        })
+        if withdrawal is not None:
+            continue
+        effective_records.append({
+            "chain_seq": r["chain_seq"],
+            "batch_id": str(r["batch_id"]),
+            "accepted_at": r["accepted_at"],
+            "seq_in_batch": r["seq_in_batch"],
+            "location": r["location"],
+            "from_person": r["from_person"],
+            "to_person": r["to_person"],
+            "seal_no": r["seal_no"],
+            "seal_changed": r["seal_changed"],
+            "seal_change_reason": r["seal_change_reason"],
+            "occurred_at": r["occurred_at"],
+            "voucher_digest": r["voucher_digest"],
+            "current_voucher_digest": current_digest,
+            "correction_trail": trail,
+            "prev_hash": r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "created_at": r["created_at"],
+        })
+
+    if effective_records:
+        last = effective_records[-1]
+        custodian = last["to_person"]
+        current_seal = last["seal_no"]
+        last_time = last["occurred_at"]
+    else:
+        custodian = exhibit.get("registered_custodian")
+        current_seal = exhibit.get("registered_initial_seal")
+        first = records[0] if records else None
+        if custodian is None and first is not None:
+            custodian = first["from_person"]
+        if current_seal is None and first is not None:
+            current_seal = first["seal_no"]
+        custodian = custodian or exhibit["custodian"]
+        current_seal = current_seal or exhibit["current_seal"]
+        last_time = None
+
+    return {
+        "exhibit_id": exhibit_id,
+        "as_of": point,
+        "registered_at": registered_at,
+        "original_chain": {
+            "chain_length": len(records),
+            "head_hash": records[-1]["record_hash"] if records else GENESIS_HASH,
+            "rings": original_rings,
+        },
+        "corrections_chain": {
+            "chain_length": len(corrections),
+            "head_hash": corrections[-1]["record_hash"] if corrections
+            else CORRECTIONS_GENESIS_HASH,
+        },
+        "withdrawals_chain": {
+            "chain_length": len(withdrawals),
+            "head_hash": withdrawals[-1]["record_hash"] if withdrawals
+            else WITHDRAWALS_GENESIS_HASH,
+        },
+        "effective_chain_length": len(effective_records),
+        "effective_records": effective_records,
+        "custodian": custodian,
+        "current_seal": current_seal,
+        "last_time": last_time,
+    }
 
 
 # ---------------------------------------------------------------- 交接批次（核心）

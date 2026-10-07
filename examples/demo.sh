@@ -4,6 +4,7 @@
 # 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计 ->
 # 已受理批次撤回（拒绝/幂等/独立撤回链/有效状态回退）-> 三链审计 ->
 # 车次整车交接（整单确认/拒绝/幂等/冲突/与单件接口共存）。
+# 知悉时点状态查询见 examples/state-at.sh。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 

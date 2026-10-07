@@ -264,6 +264,72 @@ class WithdrawalOut(BaseModel):
     last_time: Optional[datetime] = Field(default=None, description="撤回后最近一次有效交接时间")
 
 
+class PointInTimeCorrectionTrailItem(CorrectionTrailItem):
+    """指定知悉时刻已经受理/录入的补正轨迹条目。"""
+
+
+class PointInTimeHandoverRecordOut(BaseModel):
+    """指定知悉时刻仍有效的交接记录（已撤回批次不进入此列表）。"""
+
+    chain_seq: int
+    batch_id: str
+    accepted_at: datetime = Field(description="服务端批次受理时间（业务发生时间不替代该边界）")
+    seq_in_batch: int
+    location: str
+    from_person: str
+    to_person: str
+    seal_no: str
+    seal_changed: bool
+    seal_change_reason: Optional[str]
+    occurred_at: datetime
+    voucher_digest: str
+    current_voucher_digest: str = Field(description="该环节在指定知悉时刻有效的摘要")
+    correction_trail: list[PointInTimeCorrectionTrailItem] = Field(default_factory=list)
+    prev_hash: str
+    record_hash: str
+    created_at: datetime
+
+
+class PointInTimeOriginalChainRingOut(BaseModel):
+    """原交接链在指定知悉时刻的一环（含当时已撤回批次，用于摘要/哈希追溯）。"""
+
+    chain_seq: int
+    batch_id: str
+    accepted_at: datetime
+    voucher_digest: str
+    current_voucher_digest: str
+    prev_hash: str
+    record_hash: str
+    withdrawn: bool
+
+
+class PointInTimeChainSummaryOut(BaseModel):
+    chain_length: int
+    head_hash: str
+    rings: Optional[list[PointInTimeOriginalChainRingOut]] = Field(
+        default=None,
+        description="原交接链环快照；补正链/撤回链仅返回长度与链头，完整事件仍走既有审计接口",
+    )
+
+
+class PointInTimeStateOut(BaseModel):
+    """展品在指定知悉时刻的交接状态快照。"""
+
+    exhibit_id: str
+    as_of: datetime
+    registered_at: datetime
+    original_chain: PointInTimeChainSummaryOut = Field(
+        description="截至知悉时刻已受理的原交接链；长度和链头包含当时已撤回批次"
+    )
+    corrections_chain: PointInTimeChainSummaryOut
+    withdrawals_chain: PointInTimeChainSummaryOut
+    effective_chain_length: int
+    effective_records: list[PointInTimeHandoverRecordOut]
+    custodian: str
+    current_seal: str
+    last_time: Optional[datetime]
+
+
 class ChainAuditBlock(BaseModel):
     """审计复算结果中的一条链（交接链 / 补正链）。"""
 
