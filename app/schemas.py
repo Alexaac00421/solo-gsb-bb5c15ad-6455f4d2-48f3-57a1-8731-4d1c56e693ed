@@ -281,6 +281,62 @@ class ChainOut(BaseModel):
     records: list[HandoverRecordOut]
 
 
+class AsOfRecordOut(BaseModel):
+    """知悉时刻快照中的一条有效交接记录（该时点已受理且未被撤回）。
+
+    `voucher_digest` 恒定为原摘要；`current_voucher_digest` 为截至知悉时刻
+    该环节的当时有效摘要（只含该时刻之前已受理的补正）；`correction_trail`
+    同样只含该时刻之前已受理的补正轨迹。
+    """
+
+    chain_seq: int
+    batch_id: str
+    seq_in_batch: int
+    location: str
+    from_person: str
+    to_person: str
+    seal_no: str
+    seal_changed: bool
+    seal_change_reason: Optional[str]
+    occurred_at: datetime = Field(description="交接业务发生时间（仅用于呈现，不作为知悉时刻边界）")
+    voucher_digest: str
+    prev_hash: str
+    record_hash: str
+    accepted_at: datetime = Field(description="服务端批次受理时间（该记录进入可见链的边界）")
+    current_voucher_digest: str
+    correction_trail: list["CorrectionTrailItem"] = Field(default_factory=list)
+
+
+class AsOfStateOut(BaseModel):
+    """展品在指定知悉时刻（as-of）的交接状态快照。
+
+    边界一律取服务端落库时间：批次受理时间（batches.created_at）、
+    补正受理时间（digest_corrections.created_at）、撤回受理时间
+    （batch_withdrawals.created_at）；交接业务发生时间 occurred_at
+    不参与可见性判定，故事后补录的历史交接不会提前出现在快照里。
+    `chain_length`/`chain_head_hash` 为该时点原交接链（含其后被撤回的记录）；
+    `records` 仅为该时点的有效记录（已撤回批次已排除）。
+    """
+
+    exhibit_id: str
+    as_of: datetime = Field(description="知悉时刻（带时区，回显）")
+    registered_at: datetime = Field(description="展品登记时间（早于该时刻查询 -> 404）")
+    # 该时点原交接链（含当时存在、其后可能被撤回的记录）
+    chain_length: int = Field(description="知悉时刻原交接链长度（含其后被撤回批次的记录）")
+    chain_head_hash: str = Field(description="知悉时刻原交接链链头（空链为 GENESIS）")
+    # 该时点有效交接记录（排除当时已撤回批次），及当时有效状态
+    effective_chain_length: int = Field(description="知悉时刻有效交接记录数（排除当时已撤回批次）")
+    records: list[AsOfRecordOut]
+    custodian: str = Field(description="由该时点最后一条有效记录确定的保管人；有效记录为空时为登记保管人")
+    current_seal: str = Field(description="由该时点最后一条有效记录确定的封签；有效记录为空时为初始封签")
+    last_handover_time: Optional[datetime] = Field(
+        default=None, description="该时点最近一次有效交接的业务发生时间；有效记录为空时为 null"
+    )
+    # 三条事件链在该时点的长度（三链在同一数据库快照截取）
+    correction_chain_length: int = Field(description="知悉时刻已受理补正环数（按目标在可见原链内计）")
+    withdrawal_chain_length: int = Field(description="知悉时刻已受理撤回环数")
+
+
 class AuditVerifyOut(BaseModel):
     exhibit_id: str
     chain_length: int

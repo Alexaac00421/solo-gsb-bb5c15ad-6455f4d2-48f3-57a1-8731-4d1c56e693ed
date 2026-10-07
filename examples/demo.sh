@@ -437,3 +437,79 @@ curl -s -X POST "${BASE}/api/v1/handover-batches" \
 curl -s "${BASE}/api/v1/exhibits/${V1}/audit/verify" | pp
 curl -s "${BASE}/api/v1/exhibits/${V2}/audit/verify" | pp
 
+# ---------------------------------------------------------------- 知悉时刻历史快照
+# 独立演示展品：用服务端受理时间作为知悉时刻边界（业务 occurred_at 只用于呈现）。
+AID="EX-ASOF-$(date +%s)"
+echo; echo "== 41) 登记知悉时刻演示展品 ${AID} =="
+REG_JSON="$(curl -s -X POST "${BASE}/api/v1/exhibits" -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${AID}\",\"name\":\"时点快照演示展品\",\"home_location\":\"库房A\",\"custodian\":\"张伟\",\"initial_seal\":\"SEAL-1\"}")"
+echo "${REG_JSON}" | pp
+REG_AT="$(echo "${REG_JSON}" | json_field created_at)"
+echo "登记时间：${REG_AT}"
+
+# 一个稍后用于「早于登记 -> 404」的时刻（2020 年）
+echo; echo "== 42) 知悉时刻早于登记 -> 404；未知展品 -> 404 =="
+curl -s -o /dev/null -w '早于登记      -> HTTP %{http_code}\n' \
+  "${BASE}/api/v1/exhibits/${AID}/state-at?at=2020-01-01T00:00:00Z"
+curl -s -o /dev/null -w '未知展品      -> HTTP %{http_code}\n' \
+  "${BASE}/api/v1/exhibits/EX-NOT-EXIST/state-at?at=2020-01-01T00:00:00Z"
+
+echo; echo "== 43) 参数校验：缺 at / 无时区 / 非法时间 / 未来时刻 -> 422 =="
+curl -s -o /dev/null -w '缺少 at       -> HTTP %{http_code}\n' "${BASE}/api/v1/exhibits/${AID}/state-at"
+curl -s -o /dev/null -w '无时区        -> HTTP %{http_code}\n' "${BASE}/api/v1/exhibits/${AID}/state-at?at=2026-09-10T09:00:00"
+curl -s -o /dev/null -w '非法时间      -> HTTP %{http_code}\n' "${BASE}/api/v1/exhibits/${AID}/state-at?at=not-a-time"
+FUTURE="$(date -u -d '+2 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+2d +%Y-%m-%dT%H:%M:%SZ)"
+curl -s -o /dev/null -w '未来时刻      -> HTTP %{http_code}\n' "${BASE}/api/v1/exhibits/${AID}/state-at?at=${FUTURE}"
+
+# 业务时间写在 2026-09-01，但批次此刻才受理；先停 2 秒，使「受理前 1 秒」晚于登记时刻
+sleep 2
+echo; echo "== 44) 提交批次（业务发生时间 2026-09-01，服务端此刻受理）=="
+B1="$(curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-asof-b1-${AID}" \
+  -d '{"exhibit_id":"'"${AID}"'","records":[{"location":"库房A","from_person":"张伟","to_person":"李静","seal_no":"SEAL-1","occurred_at":"2026-09-01T09:00:00+08:00","voucher_digest":"sha256:ababababababababababababababababababababababababababababababab"}]}' \
+  | json_field batch_id)"
+B1_AT="$(curl -s "${BASE}/api/v1/handover-batches/${B1}" | json_field created_at)"
+echo "批次 ${B1} 受理时间：${B1_AT}（业务时间虽在 9 月 1 日，但此刻才进入可见链）"
+
+# 由服务端受理时间派生「受理前 1 秒」的知悉时刻（证明业务时间不提前让记录出现）
+B1_BEFORE="$(python3 - "${B1_AT}" <<'PY'
+import sys, urllib.parse
+from datetime import datetime, timedelta, timezone
+t = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")) - timedelta(seconds=1)
+print(urllib.parse.quote(t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"))
+PY
+)"
+echo; echo "== 45) 受理前 1 秒查询：历史交接虽已发生但尚未受理，空链回退登记状态 =="
+curl -s "${BASE}/api/v1/exhibits/${AID}/state-at?at=${B1_BEFORE}" | pp
+
+REG_AT_ENC="$(python3 - "${REG_AT}" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1]))
+PY
+)"
+echo; echo "== 46) 以登记时刻查询：空链，保管人=张伟、封签=SEAL-1、最近交接时间=null =="
+curl -s "${BASE}/api/v1/exhibits/${AID}/state-at?at=${REG_AT_ENC}" | pp
+
+# 第二、三环（第二环随后撤回），再对第一环补正，演示「有效记录 + 当时有效摘要 + 撤回排除」
+curl -s -o /dev/null -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-asof-b2-${AID}" \
+  -d '{"exhibit_id":"'"${AID}"'","records":[{"location":"展厅B","from_person":"李静","to_person":"王强","seal_no":"SEAL-1","occurred_at":"2026-09-02T09:00:00+08:00","voucher_digest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}'
+curl -s -o /dev/null -X POST "${BASE}/api/v1/exhibits/${AID}/handovers/1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-asof-c1-${AID}" \
+  -d '{"expected_digest":"sha256:ababababababababababababababababababababababababababababababab","new_digest":"sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00918273645564738291a0b1c2d3e4f50","reason":"凭证摘要录入笔误更正"}'
+# 撤回最新批次（第 2 环）
+B2="$(curl -s "${BASE}/api/v1/exhibits/${AID}/handovers/2" | json_field batch_id)"
+curl -s -o /dev/null -X POST "${BASE}/api/v1/exhibits/${AID}/batch-withdrawals" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-asof-w1-${AID}" \
+  -d "{\"batch_id\":\"${B2}\",\"reason\":\"第二环批次误登记，撤回\"}"
+
+echo; echo "== 47) 当前知悉时刻快照：原链长度/链头仍含被撤回的第 2 环；有效列表仅第 1 环（带补正后摘要）；保管人回退为李静 =="
+NOW_ENC="$(python3 - <<'PY'
+import urllib.parse
+from datetime import datetime, timezone
+print(urllib.parse.quote(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"))
+PY
+)"
+curl -s "${BASE}/api/v1/exhibits/${AID}/state-at?at=${NOW_ENC}" | pp
+
+

@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import psycopg
 from fastapi import FastAPI, Header, HTTPException, Query, Response
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
@@ -25,6 +26,7 @@ from .hashing import (
 )
 from .migrations import ensure_schema
 from .schemas import (
+    AsOfStateOut,
     AuditVerifyOut,
     BatchReport,
     BatchRequest,
@@ -1632,6 +1634,216 @@ def list_handovers(
         "chain_length": len(rows),
         "effective_chain_length": effective_count,
         "records": records,
+    }
+
+
+# ---------------------------------------------------------------- 知悉时刻快照
+
+
+def _parse_as_of(raw: str) -> datetime:
+    """解析知悉时刻查询参数：必须是带时区的 ISO-8601 时刻。
+
+    - 缺省/空串/无法解析 -> 422；
+    - 能解析但不带时区（naive）-> 422（要求显式时区，如 +08:00 / Z）；
+    - 未来时刻由路由在读取当前时间后判 422。
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="查询参数 at 为必填：带时区的知悉时刻，如 2026-10-06T09:00:00+08:00")
+    # 兼容末尾的 Z（datetime.fromisoformat 在 3.11 已支持，统一兜底）
+    candidate = text
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="at 不是合法的 ISO-8601 日期时间，应如 2026-10-06T09:00:00+08:00 或 2026-10-06T01:00:00Z",
+        )
+    if parsed.tzinfo is None:
+        raise HTTPException(status_code=422, detail="at 必须携带时区，如 2026-10-06T09:00:00+08:00 或 2026-10-06T01:00:00Z")
+    return parsed
+
+
+def _as_of_trail_item(row: dict) -> dict:
+    return {
+        "correction_id": str(row["correction_id"]),
+        "correction_seq": row["correction_seq"],
+        "target_chain_seq": row["target_chain_seq"],
+        "expected_digest": row["expected_digest"],
+        "old_digest": row["old_digest"],
+        "new_digest": row["new_digest"],
+        "reason": row["reason"],
+        "anchor_record_hash": row["anchor_record_hash"],
+        "record_hash": row["record_hash"],
+        "idempotent_replay": False,
+        "created_at": row["created_at"],
+    }
+
+
+@app.get(
+    "/api/v1/exhibits/{exhibit_id}/state-at",
+    response_model=AsOfStateOut,
+    tags=["audit"],
+)
+def get_exhibit_state_at(exhibit_id: str, at: str = Query(..., description="知悉时刻（必须带时区）")):
+    """查询展品在指定「知悉时刻」的交接状态（历史时点快照）。
+
+    三条事件链在**同一数据库快照**（REPEATABLE READ 只读事务）内按服务端
+    落库时间截取，边界互不借用：
+
+    - 交接链：以**批次受理时间** `batches.created_at` 为界（`at` 之前受理的
+      ACCEPTED 批次记录才出现）；交接业务发生时间 `occurred_at` 不作为边界，
+      因此事后补录、业务时间落在过去的历史交接不会提前出现。
+    - 补正链：以**补正受理时间** `digest_corrections.created_at` 为界；
+      每环的「当时有效摘要」只叠加该时刻之前已受理的补正。
+    - 撤回链：以**撤回受理时间** `batch_withdrawals.created_at` 为界；
+      该时点已撤回批次的记录排除出有效列表，但**原链长度与链头仍包含它们**。
+
+    返回该时点原交接链长度与链头、有效交接记录（每环带当时有效摘要），
+    以及由最后一条有效记录确定的保管人/封签/最近交接时间；有效记录为空时
+    回到登记保管人与初始封签（最近交接时间为 null）。
+
+    错误：未知展品、或知悉时刻早于展品登记时间 -> 404；
+    缺时区/无法解析/未来时刻 -> 422。
+    """
+    as_of = _parse_as_of(at)
+    now = datetime.now(timezone.utc)
+    if as_of > now:
+        raise HTTPException(
+            status_code=422,
+            detail=f"知悉时刻 {as_of.isoformat()} 晚于当前服务器时间 {now.isoformat()}，不接受未来时刻",
+        )
+
+    with get_conn() as conn:
+        # 单条只读事务固定一次快照：三条链在同一快照内截取，避免并发写入导致跨链不一致。
+        # 隔离级别/只读须在事务内第一条查询之前设置（psycopg 在事务开始时下发 BEGIN）。
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        conn.read_only = True
+        with conn.transaction():
+            exhibit = conn.execute(
+                "SELECT * FROM exhibits WHERE exhibit_id = %s",
+                (exhibit_id,),
+            ).fetchone()
+            if not exhibit:
+                raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+            registered_at = exhibit["created_at"]
+            if as_of < registered_at:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"知悉时刻 {as_of.isoformat()} 早于展品「{exhibit_id}」登记时间 "
+                           f"{registered_at.isoformat()}，该时点展品尚未登记",
+                )
+
+            # 1) 交接链：仅取 at 之前「已受理」批次写入的记录（以 batches.created_at 为界）。
+            #    REJECTED 批次从不落交接记录；这里再显式按 ACCEPTED + 受理时间上界过滤，
+            #    明确「业务发生时间不能替代受理时间」。
+            records = conn.execute(
+                """
+                SELECT r.chain_seq, r.batch_id, r.seq_in_batch, r.location,
+                       r.from_person, r.to_person, r.seal_no, r.seal_changed,
+                       r.seal_change_reason, r.occurred_at, r.voucher_digest,
+                       r.prev_hash, r.record_hash, b.created_at AS accepted_at
+                  FROM handover_records r
+                  JOIN batches b ON b.batch_id = r.batch_id
+                 WHERE r.exhibit_id = %s
+                   AND b.status = 'ACCEPTED'
+                   AND b.created_at <= %s
+                 ORDER BY r.chain_seq
+                """,
+                (exhibit_id, as_of),
+            ).fetchall()
+
+            # 2) 补正链：以补正受理时间为界；只保留锚定目标在该时点可见原链内的环
+            corrections = conn.execute(
+                """
+                SELECT correction_id, target_chain_seq, correction_seq, expected_digest,
+                       old_digest, new_digest, reason, anchor_record_hash,
+                       prev_hash, record_hash, created_at
+                  FROM digest_corrections
+                 WHERE exhibit_id = %s AND created_at <= %s
+                 ORDER BY correction_seq
+                """,
+                (exhibit_id, as_of),
+            ).fetchall()
+
+            # 3) 撤回链：以撤回受理时间为界
+            withdrawals = conn.execute(
+                """
+                SELECT withdrawal_id, batch_id, withdrawal_seq, reason, record_hash, created_at
+                  FROM batch_withdrawals
+                 WHERE exhibit_id = %s AND created_at <= %s
+                 ORDER BY withdrawal_seq
+                """,
+                (exhibit_id, as_of),
+            ).fetchall()
+
+    # 原链：chain_seq 连续前缀，链头取最后一环（其后被撤回也不影响该时点长度/链头）
+    chain_length = len(records)
+    chain_head_hash = records[-1]["record_hash"] if records else GENESIS_HASH
+
+    visible_seqs = {r["chain_seq"] for r in records}
+    trail_by_seq: dict[int, list[dict]] = {}
+    applied_corrections = 0
+    for c in corrections:
+        if c["target_chain_seq"] not in visible_seqs:
+            # 补正受理时目标交接尚未受理（理论上被外键与受理顺序阻止），快照中忽略越界环
+            continue
+        trail_by_seq.setdefault(c["target_chain_seq"], []).append(_as_of_trail_item(c))
+        applied_corrections += 1
+
+    withdrawn_batch_ids = {w["batch_id"] for w in withdrawals}
+
+    effective_records = []
+    for r in records:
+        if r["batch_id"] in withdrawn_batch_ids:
+            continue  # 该时点已撤回批次：排除出有效列表（原链长度/链头仍包含）
+        trail = trail_by_seq.get(r["chain_seq"], [])
+        current_digest = trail[-1]["new_digest"] if trail else r["voucher_digest"]
+        effective_records.append({
+            "chain_seq": r["chain_seq"],
+            "batch_id": str(r["batch_id"]),
+            "seq_in_batch": r["seq_in_batch"],
+            "location": r["location"],
+            "from_person": r["from_person"],
+            "to_person": r["to_person"],
+            "seal_no": r["seal_no"],
+            "seal_changed": r["seal_changed"],
+            "seal_change_reason": r["seal_change_reason"],
+            "occurred_at": r["occurred_at"],
+            "voucher_digest": r["voucher_digest"],
+            "prev_hash": r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "accepted_at": r["accepted_at"],
+            "current_voucher_digest": current_digest,
+            "correction_trail": trail,
+        })
+
+    # 保管人/封签/最近交接时间：由该时点最后一条有效记录确定；空链回退登记状态
+    if effective_records:
+        last = effective_records[-1]
+        custodian = last["to_person"]
+        current_seal = last["seal_no"]
+        last_handover_time = last["occurred_at"]
+    else:
+        custodian = exhibit.get("registered_custodian") or exhibit["custodian"]
+        current_seal = exhibit.get("registered_initial_seal") or exhibit["current_seal"]
+        last_handover_time = None
+
+    return {
+        "exhibit_id": exhibit_id,
+        "as_of": as_of,
+        "registered_at": registered_at,
+        "chain_length": chain_length,
+        "chain_head_hash": chain_head_hash,
+        "effective_chain_length": len(effective_records),
+        "records": effective_records,
+        "custodian": custodian,
+        "current_seal": current_seal,
+        "last_handover_time": last_handover_time,
+        "correction_chain_length": applied_corrections,
+        "withdrawal_chain_length": len(withdrawals),
     }
 
 
