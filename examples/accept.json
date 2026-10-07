@@ -1,0 +1,30 @@
+{
+  "exhibit_id": "EX-0001",
+  "records": [
+    {
+      "location": "故宫博物院地下库房A区",
+      "from_person": "张伟",
+      "to_person": "李静",
+      "seal_no": "SEAL-BJ-0001",
+      "occurred_at": "2026-09-01T09:00:00+08:00",
+      "voucher_digest": "sha256:9f2c4a1b7e3d5f608192a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    },
+    {
+      "location": "上海博物馆交接区",
+      "from_person": "李静",
+      "to_person": "王强",
+      "seal_no": "SEAL-SH-1002",
+      "seal_change_reason": "运输途中原封签磨损，经双方馆长书面授权换签（批文号 SH-2026-091）",
+      "occurred_at": "2026-09-03T14:30:00+08:00",
+      "voucher_digest": "sha256:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    },
+    {
+      "location": "上海博物馆临时展厅",
+      "from_person": "王强",
+      "to_person": "陈晨",
+      "seal_no": "SEAL-SH-1002",
+      "occurred_at": "2026-09-04T10:00:00+08:00",
+      "voucher_digest": "sha256:7f8e9d0c1b2a39485766a5b4c3d2e1f00918273645564738291a0b1c2d3e4f506"
+    }
+  ]
+}

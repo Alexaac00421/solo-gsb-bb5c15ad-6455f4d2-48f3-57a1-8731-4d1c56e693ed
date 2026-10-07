@@ -1,0 +1,5 @@
+{
+  "expected_digest": "sha256:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+  "new_digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00918273645564738291a0b1c2d3e4f50",
+  "reason": "凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）"
+}

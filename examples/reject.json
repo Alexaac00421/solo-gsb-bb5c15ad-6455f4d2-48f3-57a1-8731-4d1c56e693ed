@@ -1,0 +1,21 @@
+{
+  "exhibit_id": "EX-0002",
+  "records": [
+    {
+      "location": "国家博物馆一层库房",
+      "from_person": "王芳",
+      "to_person": "赵磊",
+      "seal_no": "SEAL-BJ-0002",
+      "occurred_at": "2026-09-02T09:00:00+08:00",
+      "voucher_digest": "sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233"
+    },
+    {
+      "location": "西安博物院交接区",
+      "from_person": "孙倩",
+      "to_person": "周明",
+      "seal_no": "SEAL-XA-2001",
+      "occurred_at": "2026-09-02T08:30:00+08:00",
+      "voucher_digest": "not-a-valid-digest"
+    }
+  ]
+}
